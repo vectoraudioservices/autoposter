@@ -1,0 +1,44 @@
+# --- Python ---
+venv/
+__pycache__/
+*.pyc
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+
+# --- Logs & runtime (keep folder, ignore contents) ---
+logs/*
+!logs/.gitkeep
+logs/sessions/*
+!logs/sessions/.gitkeep
+logs/*.log
+logs/queue.txt
+logs/post_runner.log
+logs/autoposter.log
+logs/runner.pid
+logs/watcher.pid
+logs/ig_session.json
+
+# --- Sessions ---
+logs/sessions/*.json
+
+# --- Secrets ---
+config/secrets.env
+config/clients/**/secrets.env
+
+# --- Media / exports (keep folder, ignore contents) ---
+exports/*
+!exports/.gitkeep
+content/*
+!content/.gitkeep
+
+# --- Large media just in case anywhere else ---
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.gif

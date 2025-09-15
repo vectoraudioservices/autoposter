@@ -1,0 +1,14 @@
+{
+  "timezone": "America/New_York",
+  "safe_mode": true,
+  "platforms": {
+    "instagram": true,
+    "tiktok": false,
+    "x_twitter": false,
+    "youtube_shorts": false
+  },
+  "best_times": {
+    "default_hours_24": [11, 15, 19]
+  }
+}
+
