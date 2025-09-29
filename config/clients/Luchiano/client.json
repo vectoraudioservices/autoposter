@@ -1,0 +1,15 @@
+{
+  "IG_USERNAME": "luchiano_emilio",
+  "IG_PASSWORD": "Mobmoney86!",
+  "live": true,
+  "hours": {
+    "start": "09:00",
+    "end": "22:00",
+    "timezone": "America/New_York"
+  },
+  "quotas": {
+    "reels_per_day": 2,
+    "feed_per_day": 1,
+    "stories_per_day": 3
+  }
+}

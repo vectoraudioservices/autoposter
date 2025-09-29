@@ -1,0 +1,7 @@
+watchdog==6.0.0
+python-dotenv==1.1.1
+instagrapi==2.2.1
+Pillow==11.3.0
+tweepy==4.16.0
+schedule==1.2.2
+moviepy==1.0.3

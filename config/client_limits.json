@@ -1,0 +1,8 @@
+{
+  "default_daily_quota": 3,
+  "clients": {
+    "TestArtist": 2,
+    "NightOwl": 1,
+    "Haley_Harris": 3
+  }
+}

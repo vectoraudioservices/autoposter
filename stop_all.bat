@@ -1,32 +1,25 @@
 @echo off
 setlocal
-set "BASE=%USERPROFILE%\Desktop\autoposter"
-set "LOGS=%BASE%\logs"
-
+cd /d "%~dp0"
 echo Stopping Autoposter...
 
-rem 1) Kill Python child processes by PID files (precise)
-for %%F in (watcher.pid runner.pid) do (
-  if exist "%LOGS%\%%F" (
-    for /f "usebackq delims=" %%P in ("%LOGS%\%%F") do (
-      for /f "tokens=1 delims= " %%Q in ("%%P") do (
-        echo - Killing python PID %%Q from %%F...
-        taskkill /PID %%Q /T /F >nul 2>&1
-      )
-    )
-  )
-)
-
-rem 2) Close any leftover cmd windows by title (explicit PowerShell call)
+:: Use PowerShell only (avoids CMD quoting issues)
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "Get-Process cmd -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like '*AUTOP_WATCHER*' -or $_.MainWindowTitle -like '*Autoposter - Watcher*' } | ForEach-Object { Write-Output ('- Closing watcher window PID {0}' -f $_.Id); Stop-Process -Id $_.Id -Force }"
+  "$ErrorActionPreference='SilentlyContinue';" ^
+  "$titles=@('Autoposter Watcher','Autoposter Runner','Autoposter Web Panel');" ^
+  "Get-Process | Where-Object { $titles -contains $_.MainWindowTitle } | Stop-Process -Force;" ^
+  "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'autoposter\\(scripts\\queue_runner\\.py|main\\.py|server\\web_panel\\.py)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force };" ^
+  "Remove-Item -Force 'logs\\watcher.pid','logs\\runner.pid' -ErrorAction SilentlyContinue;" ^
+  "Write-Host 'Stopped watcher and runner (if they were running).'"
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "Get-Process cmd -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like '*AUTOP_RUNNER*' -or $_.MainWindowTitle -like '*Autoposter - Runner*' } | ForEach-Object { Write-Output ('- Closing runner window PID {0}' -f $_.Id); Stop-Process -Id $_.Id -Force }"
-
-echo Stopped watcher and runner (if they were running).
-pause
 endlocal
+
+
+
+
+
+
+
 
 
 

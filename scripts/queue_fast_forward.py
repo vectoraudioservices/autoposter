@@ -1,34 +1,34 @@
-import os
+import os, sys, argparse, importlib.util
 from datetime import datetime, timedelta
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QUEUE = os.path.join(ROOT, "logs", "queue.txt")
+# Load db.py from the same folder (no package import needed)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(SCRIPT_DIR, "db.py")
+if not os.path.exists(DB_FILE):
+    raise SystemExit(f"db.py not found at: {DB_FILE}")
+
+spec = importlib.util.spec_from_file_location("db", DB_FILE)
+db = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(db)  # type: ignore
 
 def main():
-    if not os.path.exists(QUEUE):
-        print("queue.txt is empty. Nothing to fast-forward.")
-        return
-    with open(QUEUE, "r", encoding="utf-8") as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
+    ap = argparse.ArgumentParser(description="Fast-forward all queued DB jobs to run soon.")
+    ap.add_argument("--seconds", type=int, default=10, help="How many seconds from now to schedule (default: 10)")
+    args = ap.parse_args()
 
-    if not lines:
-        print("queue.txt is empty. Nothing to fast-forward.")
-        return
+    db.init_db()
+    now = datetime.now()
+    new_eta = (now + timedelta(seconds=max(1, args.seconds))).isoformat()
 
-    now = datetime.now().replace(microsecond=0) + timedelta(seconds=5)
-    new_lines = []
-    for ln in lines:
-        parts = ln.split("|", 2)
-        if len(parts) < 3:
-            continue
-        parts[0] = now.isoformat()
-        new_lines.append("|".join(parts))
+    # Fetch queued items (any ETA), then set new ETA
+    with db.get_conn() as c:
+        rows = c.execute("SELECT id, client, path, eta FROM jobs WHERE status='queued' ORDER BY eta ASC").fetchall()
+        for r in rows:
+            c.execute("UPDATE jobs SET eta=? WHERE id=?", (new_eta, r["id"]))
 
-    with open(QUEUE, "w", encoding="utf-8") as f:
-        f.write("\n".join(new_lines) + "\n")
-
-    print(f"Fast-forwarded {len(new_lines)} queued item(s) to {now.isoformat()}")
+    print(f"Fast-forwarded {len(rows)} queued item(s) to {new_eta}")
 
 if __name__ == "__main__":
     main()
+
 

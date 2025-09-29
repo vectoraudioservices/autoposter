@@ -1,13 +1,12 @@
 {
-  "VectorManagement": {
-    "style": "default",
-    "signature": "Follow @VectorManagement for daily drops. 🚀",
-    "additional_hashtags": ["vector", "music", "marketing"]
-  },
   "MerkabaEntertainment": {
-    "style": "hashtags_first",
-    "signature": "Powered by Merkaba Entertainment ✨",
-    "additional_hashtags": ["merkaba", "entertainment", "indie", "newmusic"]
+    "path": "config/clients/MerkabaEntertainment/client.json"
+  },
+  "VectorManagement": {
+    "path": "config/clients/VectorManagement/client.json"
+  },
+  "Luchiano": {
+    "path": "config/clients/Luchiano/client.json"
   }
 }
 

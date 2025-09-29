@@ -1,109 +1,73 @@
-import os
 import json
+from pathlib import Path
 from instagrapi import Client
+from instagrapi.exceptions import LoginRequired, TwoFactorRequired
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOGS_DIR = os.path.join(ROOT, "logs")
-CONFIG_DIR = os.path.join(ROOT, "config")
+CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+CLIENTS_DIR = CONFIG_DIR / "clients"
+SESSIONS_DIR = CONFIG_DIR / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Legacy (global) locations for backward compatibility
-GLOBAL_SECRETS = os.path.join(CONFIG_DIR, "secrets.env")
-GLOBAL_SESSION = os.path.join(LOGS_DIR, "ig_session.json")
+def _cfg_path(client_name: str) -> Path:
+    return CLIENTS_DIR / client_name / "client.json"
 
-def _load_env(path: str) -> dict:
-    env = {}
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fh:
-            for ln in fh:
-                ln = ln.strip()
-                if not ln or ln.startswith("#") or "=" not in ln:
-                    continue
-                k, v = ln.split("=", 1)
-                env[k.strip()] = v.strip()
-    return env
+def _session_path(client_name: str) -> Path:
+    return SESSIONS_DIR / f"{client_name}.json"
 
-def _client_paths(client_name: str | None):
-    """
-    Return (secrets_path, session_path) for the given client.
-    If client_name is None, fall back to global legacy paths.
-    """
-    if not client_name:
-        return GLOBAL_SECRETS, GLOBAL_SESSION
-    base = os.path.join(CONFIG_DIR, "clients", client_name)
-    secrets = os.path.join(base, "secrets.env")
-    sessions_dir = os.path.join(LOGS_DIR, "sessions")
-    os.makedirs(sessions_dir, exist_ok=True)
-    session = os.path.join(sessions_dir, f"ig_session_{client_name}.json")
-    return secrets, session
+def load_client_config(client_name: str) -> dict:
+    p = _cfg_path(client_name)
+    if not p.exists():
+        raise FileNotFoundError(f"Missing config: {p}")
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
-def _save_session(cl: Client, session_path: str):
-    data = cl.get_settings()
-    with open(session_path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh)
+def make_client() -> Client:
+    cl = Client()
+    cl.request_timeout = 30
+    return cl
 
-def _load_session(cl: Client, session_path: str) -> bool:
-    if not os.path.exists(session_path):
-        return False
+def try_session(cl: Client, client_name: str) -> bool:
+    s = _session_path(client_name)
+    if s.exists():
+        try:
+            cl.load_settings(s)
+            cl.get_timeline_feed()
+            return True
+        except Exception:
+            pass
+    return False
+
+def save_session(cl: Client, client_name: str):
+    cl.dump_settings(_session_path(client_name))
+
+def ig_login_test(client_name: str) -> dict:
+    cfg = load_client_config(client_name)
+    ig_user = cfg.get("IG_USERNAME")
+    ig_pass = cfg.get("IG_PASSWORD")
+    if not ig_user or not ig_pass:
+        return {"ok": False, "via": None, "username": None, "user_id": None, "two_factor": False,
+                "error": f"Missing IG_USERNAME/IG_PASSWORD for client {client_name}"}
+
+    cl = make_client()
+
+    if try_session(cl, client_name):
+        try:
+            me = cl.user_info_by_username(ig_user)
+            return {"ok": True, "via": "session", "username": ig_user, "user_id": int(me.pk), "two_factor": False, "error": None}
+        except Exception as e:
+            return {"ok": False, "via": "session", "username": ig_user, "user_id": None, "two_factor": False, "error": str(e)}
+
     try:
-        with open(session_path, "r", encoding="utf-8") as fh:
-            settings = json.load(fh)
-        cl.set_settings(settings)
-        cl.get_timeline_feed()  # light ping to validate
-        return True
-    except Exception:
-        return False
-
-def _ensure_logged_in(cl: Client, client_name: str | None = None):
-    secrets_path, session_path = _client_paths(client_name)
-    env = _load_env(secrets_path)
-    username = env.get("IG_USERNAME", "")
-    password = env.get("IG_PASSWORD", "")
-    twofa_code = env.get("IG_2FA_CODE") or None
-
-    if not username or not password:
-        loc = f"config\\clients\\{client_name}\\secrets.env" if client_name else "config\\secrets.env"
-        raise RuntimeError(f"Missing IG_USERNAME or IG_PASSWORD in {loc}")
-
-    # Try existing session first
-    if _load_session(cl, session_path):
-        return
-
-    # Fresh login (2FA optional)
-    if twofa_code:
-        cl.login(username, password, verification_code=twofa_code)
-    else:
-        cl.login(username, password)
-
-    _save_session(cl, session_path)
-
-def ig_login_test(client_name: str | None = None) -> str:
-    """
-    Verifies login/session and returns username.
-    If client_name is provided, uses that client's secrets + session.
-    """
-    cl = Client()
-    _ensure_logged_in(cl, client_name=client_name)
-    me = cl.account_info()
-    return f"Login OK as @{me.username}" + (f" (client={client_name})" if client_name else "")
-
-def post_instagram(filepath: str, caption: str, client_name: str | None = None) -> str:
-    """
-    Posts photo/video to Instagram Feed for given client (or global if None).
-    """
-    cl = Client()
-    _ensure_logged_in(cl, client_name=client_name)
-
-    lower = (filepath or "").lower()
-    if lower.endswith((".jpg", ".jpeg", ".png")):
-        media = cl.photo_upload(path=filepath, caption=caption)
-        return f"IG photo posted: {os.path.basename(filepath)} (id={media.pk})" + (f" [client={client_name}]" if client_name else "")
-    elif lower.endswith(".mp4"):
-        media = cl.video_upload(path=filepath, caption=caption)
-        return f"IG video posted: {os.path.basename(filepath)} (id={media.pk})" + (f" [client={client_name}]" if client_name else "")
-    else:
-        # Fallback try as video
-        media = cl.video_upload(path=filepath, caption=caption)
-        return f"IG media posted (fallback): {os.path.basename(filepath)} (id={media.pk})" + (f" [client={client_name}]" if client_name else "")
-
-
+        cl.set_device(cl.generate_device(ig_user))
+        cl.login(ig_user, ig_pass)
+        save_session(cl, client_name)
+        me = cl.user_info_by_username(ig_user)
+        return {"ok": True, "via": "password", "username": ig_user, "user_id": int(me.pk), "two_factor": False, "error": None}
+    except TwoFactorRequired:
+        return {"ok": False, "via": "password", "username": ig_user, "user_id": None, "two_factor": True,
+                "error": "Two-factor authentication required."}
+    except LoginRequired as e:
+        return {"ok": False, "via": "password", "username": ig_user, "user_id": None, "two_factor": False, "error": f"Login required: {e}"}
+    except Exception as e:
+        return {"ok": False, "via": "password", "username": ig_user, "user_id": None, "two_factor": False, "error": str(e)}
 

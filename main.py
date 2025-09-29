@@ -1,110 +1,125 @@
-import os
 import json
 import time
-from datetime import datetime
+import inspect
+from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# --- Paths & folders ---
-ROOT = os.path.dirname(os.path.abspath(__file__))
-FOLDERS = ["content", "logs", "scripts", "exports", "config"]
-for f in FOLDERS:
-    os.makedirs(os.path.join(ROOT, f), exist_ok=True)
+# Your DB helpers
+import scripts.db as db
 
-CONTENT_DIR = os.path.join(ROOT, "content")
-LOGS_DIR = os.path.join(ROOT, "logs")
-CONFIG_DIR = os.path.join(ROOT, "config")
-LOG_FILE = os.path.join(LOGS_DIR, "autoposter.log")
+CONTENT_ROOT = Path("content")
+CLIENTS_JSON = Path("config/clients.json")
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 
-CLIENTS_FILE = os.path.join(CONFIG_DIR, "clients.json")
-CURRENT_CLIENT_FILE = os.path.join(CONFIG_DIR, "current_client.txt")
 
-# --- Logging ---
-def log(message: str):
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{stamp}] {message}"
-    print(line)
-    with open(LOG_FILE, "a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-
-# --- PID file ---
-WATCHER_PID_FILE = os.path.join(LOGS_DIR, "watcher.pid")
-try:
-    with open(WATCHER_PID_FILE, "w", encoding="utf-8") as _pf:
-        _pf.write(str(os.getpid()))
-except Exception:
-    pass
-
-# --- Helpers for client profiles ---
-def load_clients() -> dict:
+def load_known_clients():
+    if not CLIENTS_JSON.exists():
+        return set()
     try:
-        with open(CLIENTS_FILE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception as e:
-        log(f"CLIENTS LOAD WARN: {e}")
-        return {}
-
-def load_current_client_name() -> str:
-    try:
-        with open(CURRENT_CLIENT_FILE, "r", encoding="utf-8") as fh:
-            name = fh.read().strip()
-            return name or "VectorManagement"
+        data = json.loads(CLIENTS_JSON.read_text(encoding="utf-8"))
+        return set(data.keys())
     except Exception:
-        return "VectorManagement"
+        return set()
 
-def infer_client_from_path(abs_path: str) -> str:
-    """If file is under content/<Client>/..., return <Client> else fallback."""
+
+def ensure_folders(clients: set[str]):
+    for c in clients:
+        for sub in ("reels", "feed", "stories"):
+            (CONTENT_ROOT / c / sub).mkdir(parents=True, exist_ok=True)
+
+
+def infer_client(known_clients: set[str], file_path: Path):
+    """Determine client from folder: content/<Client>/<type>/<file>"""
     try:
-        rel = os.path.relpath(abs_path, CONTENT_DIR)
-        first = rel.split(os.sep, 1)[0]
-        if first and first not in (".", "") and first.lower() != os.path.basename(CONTENT_DIR).lower():
-            return first
+        rel = file_path.resolve().relative_to(CONTENT_ROOT.resolve())
     except Exception:
-        pass
-    return load_current_client_name()
+        return None
+    parts = list(rel.parts)
+    if len(parts) >= 3:
+        maybe_client, maybe_type = parts[0], parts[1]
+        if maybe_client in known_clients and maybe_type in {"reels", "feed", "stories"}:
+            return maybe_client
+    return None
 
-# --- Event handler ---
-class NewContentHandler(FileSystemEventHandler):
-    def on_created(self, event):
-        if event.is_directory:
+
+def add_job_flex(conn, client: str, file_path: str):
+    """
+    Call scripts.db.add_job with only the params it actually accepts.
+    Supports variants like:
+      - add_job(conn, client, file)
+      - add_job(conn, client, file, caption=None)
+      - add_job(conn, client, file, eta_iso_utc=None)
+      - add_job(conn, client, file, when=None, caption=None)
+    """
+    fn = db.add_job
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.items())
+
+    # Required base positional args we can always provide in order:
+    base_positional = [conn, client, file_path]
+
+    # Build kwargs ONLY for names that exist (avoid "multiple values" errors)
+    extra_kwargs = {}
+    for name, param in params[3:]:
+        # Only pass explicit names we recognize and set them to None by default
+        if name in ("caption", "cap", "text"):
+            extra_kwargs[name] = None
+        elif name in ("eta_iso_utc", "when", "when_utc", "scheduled_at", "schedule_at"):
+            extra_kwargs[name] = None
+        # else: ignore unknown optional params (db layer will set defaults)
+
+    return fn(*base_positional, **extra_kwargs)
+
+
+class MediaHandler(FileSystemEventHandler):
+    def __init__(self, conn, known_clients: set[str]):
+        super().__init__()
+        self.conn = conn
+        self.known_clients = known_clients
+
+    def _enqueue(self, file_path: Path):
+        if file_path.suffix.lower() not in VIDEO_EXTS:
             return
-        time.sleep(0.5)  # let file finish writing
-
-        filename = os.path.basename(event.src_path)
-        abs_path = os.path.abspath(event.src_path)
-        client_name = infer_client_from_path(abs_path)
-
-        log(f"NEW FILE DETECTED: {os.path.relpath(abs_path, CONTENT_DIR)}")
-        log(f"READY TO PROCESS: {filename} (client={client_name})")
-
-        # Generate a simple caption
-        caption = f"🔥 New drop • {datetime.now().strftime('%b %d')}\nFollow @VectorManagement for daily drops. 🚀"
+        client = infer_client(self.known_clients, file_path)
+        if not client:
+            print(f"⚠️ Skipping {file_path}: cannot determine client (use content/<Client>/(reels|feed|stories)/)")
+            return
         try:
-            from scripts.scheduler import add_to_queue
-            eta = add_to_queue(abs_path, caption, minutes_from_now=10)
-            log(f"SCHEDULED: {filename} at {eta.strftime('%Y-%m-%d %H:%M')} (client={client_name})")
+            qid = add_job_flex(self.conn, client, str(file_path.resolve()))
+            print(f"✅ Enqueued for {client}: {file_path.name} (queue_id={qid})")
         except Exception as e:
-            log(f"SCHEDULE ERROR: {e}")
+            print(f"❌ Failed enqueue {file_path}: {e}")
 
-if __name__ == "__main__":
-    log("Startup: verified folder structure.")
-    log("Watching /content for new files...")
-    event_handler = NewContentHandler()
+    def on_created(self, event):
+        if not event.is_directory:
+            self._enqueue(Path(event.src_path))
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._enqueue(Path(event.dest_path))
+
+
+def main():
+    known = load_known_clients()
+    ensure_folders(known)
+    print(f"👀 Multi-client Watcher running. Known clients: {', '.join(sorted(known)) or '(none)'}")
+    print("   Drop files under: content/<Client>/(reels|feed|stories)/")
+
+    conn = db.get_conn()
+    handler = MediaHandler(conn, known)
     observer = Observer()
-    # recursive=True so client subfolders work
-    observer.schedule(event_handler, CONTENT_DIR, recursive=True)
+    # One recursive watcher over content/ handles all clients & subfolders
+    observer.schedule(handler, str(CONTENT_ROOT), recursive=True)
+
     observer.start()
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        log("Shutdown requested. Stopping watcher...")
         observer.stop()
     observer.join()
 
 
-
-
-
-
-
+if __name__ == "__main__":
+    main()

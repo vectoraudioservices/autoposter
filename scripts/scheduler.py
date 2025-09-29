@@ -1,67 +1,91 @@
-import os
-import json
-from datetime import datetime, timedelta
+# scripts/scheduler.py
+from __future__ import annotations
+import os, json, importlib.util
+from datetime import datetime
+from typing import Tuple
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG = os.path.join(ROOT, "config", "schedule.json")
-LOGS = os.path.join(ROOT, "logs")
-QUEUE = os.path.join(LOGS, "queue.txt")
+CONFIG_FILE = os.path.join(ROOT, "config", "schedule.json")
+CONTENT_DIR = os.path.join(ROOT, "content")
 
-os.makedirs(LOGS, exist_ok=True)
+def _load_mod(name: str, path: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod
 
-def _load_config():
+# Load our local helpers/modules without relying on package imports
+_db = _load_mod("db", os.path.join(ROOT, "scripts", "db.py"))
+_tz = _load_mod("scheduler_tz", os.path.join(ROOT, "scripts", "scheduler_tz.py"))
+next_local_slot = _tz.next_local_slot
+to_local = _tz.to_local
+
+DEFAULT_HOURS = [11, 15, 19]  # local hours (America/New_York)
+
+def _read_config() -> dict:
     try:
-        with open(CONFIG, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"timezone": "America/New_York", "best_times": {"default_hours_24": [11, 15, 19]}}
+        return {}
 
-def _next_slot(now: datetime, hours: list[int]) -> datetime:
-    today = now.replace(minute=0, second=0, microsecond=0)
-    candidates = [today.replace(hour=h) for h in hours]
-    for t in candidates:
-        if t > now:
-            return t
-    return candidates[0] + timedelta(days=1)
+def _infer_client_and_type(abs_path: str) -> Tuple[str, str]:
+    """
+    Map content\<Client>\<feed|stories|reels|weekly>\file to (client, ctype).
+    Fallback: ('VectorManagement', 'feed')
+    """
+    rel = os.path.relpath(abs_path, CONTENT_DIR)
+    parts = rel.split(os.sep)
+    client = "VectorManagement"
+    ctype = "feed"
+    if len(parts) >= 2:
+        client = parts[0] or client
+        c = (parts[1] or "").lower()
+        if c in ("feed", "stories", "reels", "weekly"):
+            ctype = c
+    return client, ctype
 
-def _infer_client_from_path(filepath: str) -> str:
-    content_dir = os.path.join(ROOT, "content")
-    try:
-        rel = os.path.relpath(filepath, content_dir)
-        parts = rel.split(os.sep)
-        if len(parts) >= 2 and parts[0] not in (".", ""):
-            return parts[0]
-    except Exception:
-        pass
-    current_txt = os.path.join(ROOT, "config", "current_client.txt")
-    try:
-        with open(current_txt, "r", encoding="utf-8") as f:
-            name = f.read().strip()
-            return name or "VectorManagement"
-    except Exception:
-        return "VectorManagement"
+def _hours_for_type(cfg: dict, ctype: str) -> list[int]:
+    bt = (cfg.get("best_times") or {})
+    if ctype == "reels":
+        return bt.get("reels_hours_24") or bt.get("default_hours_24") or DEFAULT_HOURS
+    if ctype == "stories":
+        return bt.get("stories_hours_24") or bt.get("default_hours_24") or DEFAULT_HOURS
+    if ctype == "weekly":
+        return bt.get("weekly_hours_24") or bt.get("default_hours_24") or DEFAULT_HOURS
+    return bt.get("default_hours_24") or DEFAULT_HOURS
 
-def add_to_queue(filepath: str, caption: str, minutes_from_now: int = None) -> datetime:
-    cfg = _load_config()
-    hours = cfg.get("best_times", {}).get("default_hours_24", [11, 15, 19])
-    now = datetime.now()
+def add_to_queue(path: str, caption: str) -> datetime:
+    """
+    Enqueue a job at the next time slot for its content type.
+    Returns the ETA as a local datetime (for display); stores UTC in DB.
+    """
+    abs_path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
 
-    if minutes_from_now is not None:
-        eta = now + timedelta(minutes=minutes_from_now)
-    else:
-        eta = _next_slot(now, hours)
+    cfg = _read_config()
+    client, ctype = _infer_client_and_type(abs_path)
+    hours = _hours_for_type(cfg, ctype)
 
-    client = _infer_client_from_path(filepath)
-    abspath = os.path.abspath(filepath)
+    # compute UTC ETA and store
+    eta_utc = next_local_slot(hours)  # returns aware UTC datetime
+    eta_iso_utc = eta_utc.isoformat()
 
-    # Escape newlines safely
-    safe_caption = caption.replace(os.linesep, "\\n")
+    _db.init_db()
+    _db.add_job(client, abs_path, caption, eta_iso_utc)
 
-    line = f"{eta.isoformat()}|{abspath}|{safe_caption}|client={client}"
-    with open(QUEUE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    # return local time for logs
+    return to_local(eta_utc)
 
-    return eta
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python scripts/scheduler.py <path-to-file> [caption]")
+        raise SystemExit(1)
+    p = sys.argv[1]
+    cap = sys.argv[2] if len(sys.argv) >= 3 else "Test"
+    eta = add_to_queue(p, cap)
+    print("Queued:", p, "| ETA local:", eta.strftime("%Y-%m-%d %H:%M"))
 
 
 

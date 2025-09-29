@@ -1,0 +1,9 @@
+{
+  "name": "TestArtist",
+  "created": "2025-09-15T23:49:07",
+  "hours_24": [
+    12,
+    18
+  ],
+  "daily_quota": 2
+}
