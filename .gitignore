@@ -42,3 +42,6 @@ content/*
 *.jpeg
 *.png
 *.gif
+
+*.db
+*.zip
