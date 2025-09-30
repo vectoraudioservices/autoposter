@@ -1,0 +1,25 @@
+scripts\post_instagram.py:55:            me = cl.user_info_by_username(ig_user)
+scripts\post_instagram.py:64:        me = cl.user_info_by_username(ig_user)
+venv\Lib\site-packages\instagrapi\mixins\public.py:31:    public_requests_count = 0
+venv\Lib\site-packages\instagrapi\mixins\public.py:36:    public_request_logger = logging.getLogger("public_request")
+venv\Lib\site-packages\instagrapi\mixins\public.py:77:    def public_request(
+venv\Lib\site-packages\instagrapi\mixins\public.py:99:                return self._send_public_request(url, **kwargs)
+venv\Lib\site-packages\instagrapi\mixins\public.py:125:    def _send_public_request(
+venv\Lib\site-packages\instagrapi\mixins\public.py:135:        self.public_requests_count += 1
+venv\Lib\site-packages\instagrapi\mixins\public.py:173:            self.public_request_logger.debug(
+venv\Lib\site-packages\instagrapi\mixins\public.py:174:                "public_request %s: %s", response.status_code, response.url
+venv\Lib\site-packages\instagrapi\mixins\public.py:177:            self.public_request_logger.info(
+venv\Lib\site-packages\instagrapi\mixins\public.py:195:            self.public_request_logger.error(
+venv\Lib\site-packages\instagrapi\mixins\public.py:196:                "Status %s: JSONDecodeError in public_request (url=%s) >>> %s",
+venv\Lib\site-packages\instagrapi\mixins\public.py:231:        response = self.public_request(
+venv\Lib\site-packages\instagrapi\mixins\public.py:259:            body_json = self.public_request(
+venv\Lib\site-packages\instagrapi\mixins\public.py:299:        response = self.public_request(url, params=params, return_json=True)
+venv\Lib\site-packages\instagrapi\mixins\story.py:298:        response = self._send_public_request(
+venv\Lib\site-packages\instagrapi\mixins\user.py:49:        return str(self.user_info_by_username(username).pk)
+venv\Lib\site-packages\instagrapi\mixins\user.py:129:    def user_info_by_username_gql(self, username: str) -> User:
+venv\Lib\site-packages\instagrapi\mixins\user.py:146:    def user_info_by_username_v1(self, username: str) -> User:
+venv\Lib\site-packages\instagrapi\mixins\user.py:171:    def user_info_by_username(self, username: str, use_cache: bool = True) -> User:
+venv\Lib\site-packages\instagrapi\mixins\user.py:191:                    user = self.user_info_by_username_gql(username)
+venv\Lib\site-packages\instagrapi\mixins\user.py:195:                    user = self.user_info_by_username_gql(username)  # retry
+venv\Lib\site-packages\instagrapi\mixins\user.py:199:                user = self.user_info_by_username_v1(username)
+venv\Lib\site-packages\instagrapi\mixins\user.py:221:            return self.user_info_by_username_gql(

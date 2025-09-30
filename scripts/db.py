@@ -1,101 +1,99 @@
-# scripts/db.py
-import os, sqlite3, hashlib
-from contextlib import contextmanager
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(ROOT, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "autoposter.db")
+from __future__ import annotations
+import sqlite3, json
+from pathlib import Path
+from datetime import datetime, timezone
 
-def _row_factory(cursor, row):
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "autoposter.db"
 
-@contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-    conn.row_factory = _row_factory
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        yield conn
-    finally:
-        conn.close()
+def _conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 def init_db():
-    with get_conn() as c:
+    with _conn() as c:
         c.execute("""
-        CREATE TABLE IF NOT EXISTS jobs(
-          id INTEGER PRIMARY KEY,
-          client    TEXT NOT NULL,
-          path      TEXT NOT NULL,
-          caption   TEXT NOT NULL,
-          eta       TEXT NOT NULL, -- UTC ISO8601
-          status    TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','in_progress','done','failed')),
-          posted_at TEXT,
-          attempts  INTEGER DEFAULT 0,
-          last_error TEXT,
-          job_key   TEXT UNIQUE
-        );""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_due ON jobs(status, eta);")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_client ON jobs(client);")
+        CREATE TABLE IF NOT EXISTS jobs (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          client       TEXT NOT NULL,
+          path         TEXT NOT NULL,
+          content_type TEXT NOT NULL,
+          caption      TEXT,
+          eta          TEXT NOT NULL,
+          status       TEXT NOT NULL DEFAULT 'queued',
+          created_at   TEXT NOT NULL,
+          posted_at    TEXT,
+          extras       TEXT
+        )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs(client)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_eta ON jobs(eta)")
+        # HARD DEDUPE: one row per (client, path)
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_client_path ON jobs(client, path)")
+        c.commit()
 
-def _job_key(client, path, eta_iso_utc):
-    raw = f"{client}|{os.path.abspath(path)}|{eta_iso_utc}".encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()
+def get_job_by_path(client: str, path: str):
+    with _conn() as c:
+        return c.execute("SELECT * FROM jobs WHERE client=? AND path=? LIMIT 1", (client, path)).fetchone()
 
-def add_job(client, path, caption, eta_iso_utc):
-    init_db()
-    key = _job_key(client, path, eta_iso_utc)
-    with get_conn() as c:
-        c.execute("""
-            INSERT OR IGNORE INTO jobs(client,path,caption,eta,status,job_key)
-            VALUES (?,?,?,?, 'queued', ?)
-        """, (client, os.path.abspath(path), caption, eta_iso_utc, key))
-        row = c.execute("SELECT id FROM jobs WHERE job_key=?", (key,)).fetchone()
-        return row["id"]
+def add_job(client: str, path: str, *, content_type: str, caption: str|None=None, eta: str|None=None, extras: dict|None=None) -> int:
+    eta = eta or _now_iso()
+    ex = json.dumps(extras or {}, ensure_ascii=False)
+    with _conn() as c:
+        cur = c.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO jobs (client, path, content_type, caption, eta, status, created_at, extras) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)",
+            (client, path, content_type, caption, eta, _now_iso(), ex)
+        )
+        row = c.execute("SELECT id FROM jobs WHERE client=? AND path=? LIMIT 1", (client, path)).fetchone()
+        c.commit()
+        return int(row["id"])
 
-def upsert_client(client_name: str):
-    # placeholder for future clients table; ensures DB ready
-    init_db()
-
-def get_due_jobs(limit=50):
-    init_db()
-    with get_conn() as c:
-        return c.execute("""
-            SELECT * FROM jobs
-            WHERE status='queued' AND eta <= datetime('now')
-            ORDER BY eta ASC
-            LIMIT ?
-        """, (limit,)).fetchall()
+def get_due_jobs(limit: int = 50, client: str | None = None, now_iso: str | None = None):
+    now_iso = now_iso or _now_iso()
+    with _conn() as c:
+        if client:
+            return c.execute(
+                "SELECT * FROM jobs WHERE status='queued' AND client=? AND (eta IS NULL OR eta <= ?) "
+                "ORDER BY id ASC LIMIT ?",
+                (client, now_iso, limit)
+            ).fetchall()
+        return c.execute(
+            "SELECT * FROM jobs WHERE status='queued' AND (eta IS NULL OR eta <= ?) "
+            "ORDER BY id ASC LIMIT ?",
+            (now_iso, limit)
+        ).fetchall()
 
 def mark_in_progress(job_id: int):
-    with get_conn() as c:
-        c.execute("UPDATE jobs SET status='in_progress', attempts=attempts+1 WHERE id=?", (job_id,))
+    with _conn() as c:
+        c.execute("UPDATE jobs SET status='in_progress' WHERE id=?", (job_id,))
+        c.commit()
 
 def mark_done(job_id: int):
-    with get_conn() as c:
-        c.execute("UPDATE jobs SET status='done', posted_at=datetime('now') WHERE id=?", (job_id,))
+    with _conn() as c:
+        c.execute("UPDATE jobs SET status='done', posted_at=? WHERE id=?", (_now_iso(), job_id))
+        c.commit()
 
-def reschedule(job_id: int, new_eta_iso_utc: str, error_msg: str | None=None, set_failed: bool=False):
-    with get_conn() as c:
-        if set_failed:
-            c.execute("UPDATE jobs SET status='failed', last_error=? WHERE id=?", (error_msg or "", job_id))
+def reschedule(job_id: int, new_eta: str, reason: str|None=None):
+    with _conn() as c:
+        if reason:
+            row = c.execute("SELECT extras FROM jobs WHERE id=?", (job_id,)).fetchone()
+            old = {}
+            if row and row["extras"]:
+                try: old = json.loads(row["extras"])
+                except Exception: old = {}
+            old["reschedule_reason"] = reason
+            ex = json.dumps(old, ensure_ascii=False)
+            c.execute("UPDATE jobs SET eta=?, status='queued', extras=? WHERE id=?", (new_eta, ex, job_id))
         else:
-            c.execute("UPDATE jobs SET status='queued', eta=?, last_error=? WHERE id=?", (new_eta_iso_utc, error_msg or "", job_id))
-
-def list_queue(limit=200):
-    init_db()
-    with get_conn() as c:
-        return c.execute("""
-            SELECT * FROM jobs
-            WHERE status='queued'
-            ORDER BY eta ASC
-            LIMIT ?
-        """,(limit,)).fetchall()
-
-def clear_queue():
-    with get_conn() as c:
-        c.execute("DELETE FROM jobs WHERE status='queued';")
+            c.execute("UPDATE jobs SET eta=?, status='queued' WHERE id=?", (new_eta, job_id))
+        c.commit()

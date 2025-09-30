@@ -1,73 +1,61 @@
-import json
+from __future__ import annotations
+import json, os
 from pathlib import Path
 from instagrapi import Client
-from instagrapi.exceptions import LoginRequired, TwoFactorRequired
 
-CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_DIR = ROOT / "config"
 CLIENTS_DIR = CONFIG_DIR / "clients"
-SESSIONS_DIR = CONFIG_DIR / "sessions"
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+SESS_DIR = CONFIG_DIR / "sessions"
+SESS_DIR.mkdir(parents=True, exist_ok=True)
 
-def _cfg_path(client_name: str) -> Path:
-    return CLIENTS_DIR / client_name / "client.json"
+def _cfg_path(client: str) -> Path:
+    return CLIENTS_DIR / client / "client.json"
 
-def _session_path(client_name: str) -> Path:
-    return SESSIONS_DIR / f"{client_name}.json"
+def _load_cfg(client: str) -> dict:
+    return json.loads(_cfg_path(client).read_text(encoding="utf-8"))
 
-def load_client_config(client_name: str) -> dict:
-    p = _cfg_path(client_name)
-    if not p.exists():
-        raise FileNotFoundError(f"Missing config: {p}")
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def _sess_file(client: str) -> Path:
+    return SESS_DIR / f"{client}.json"
 
-def make_client() -> Client:
+def _build_client(client: str) -> Client:
+    cfg = _load_cfg(client)
+    user = cfg.get("IG_USERNAME")
+    pw   = cfg.get("IG_PASSWORD")
+    if not (user and pw):
+        raise RuntimeError(f"Missing IG_USERNAME/IG_PASSWORD in {_cfg_path(client)}")
+
     cl = Client()
-    cl.request_timeout = 30
+    # DO NOT set a custom device or call generate_device; let instagrapi manage it
+  
+
+    sess = _sess_file(client)
+    if sess.exists():
+        try:
+            cl.load_settings(str(sess))
+            # Private sanity check; avoids any public/GQL endpoints
+            cl.account_info()
+            return cl
+        except Exception:
+            # fall through to a fresh login
+            pass
+
+    twofa = os.getenv("IG_2FA_CODE")
+    if twofa:
+        cl.login(user, pw, verification_code=twofa)
+    else:
+        cl.login(user, pw)
+    cl.dump_settings(str(sess))
     return cl
 
-def try_session(cl: Client, client_name: str) -> bool:
-    s = _session_path(client_name)
-    if s.exists():
-        try:
-            cl.load_settings(s)
-            cl.get_timeline_feed()
-            return True
-        except Exception:
-            pass
-    return False
+def post_photo(client: str, path: str, caption: str|None, root=None):
+    return _build_client(client).photo_upload(path, caption or "")
 
-def save_session(cl: Client, client_name: str):
-    cl.dump_settings(_session_path(client_name))
+def post_video(client: str, path: str, caption: str|None, root=None):
+    return _build_client(client).video_upload(path, caption or "")
 
-def ig_login_test(client_name: str) -> dict:
-    cfg = load_client_config(client_name)
-    ig_user = cfg.get("IG_USERNAME")
-    ig_pass = cfg.get("IG_PASSWORD")
-    if not ig_user or not ig_pass:
-        return {"ok": False, "via": None, "username": None, "user_id": None, "two_factor": False,
-                "error": f"Missing IG_USERNAME/IG_PASSWORD for client {client_name}"}
+def post_reel(client: str, path: str, caption: str|None):
+    return _build_client(client).clip_upload(path, caption or "")
 
-    cl = make_client()
-
-    if try_session(cl, client_name):
-        try:
-            me = cl.user_info_by_username(ig_user)
-            return {"ok": True, "via": "session", "username": ig_user, "user_id": int(me.pk), "two_factor": False, "error": None}
-        except Exception as e:
-            return {"ok": False, "via": "session", "username": ig_user, "user_id": None, "two_factor": False, "error": str(e)}
-
-    try:
-        cl.set_device(cl.generate_device(ig_user))
-        cl.login(ig_user, ig_pass)
-        save_session(cl, client_name)
-        me = cl.user_info_by_username(ig_user)
-        return {"ok": True, "via": "password", "username": ig_user, "user_id": int(me.pk), "two_factor": False, "error": None}
-    except TwoFactorRequired:
-        return {"ok": False, "via": "password", "username": ig_user, "user_id": None, "two_factor": True,
-                "error": "Two-factor authentication required."}
-    except LoginRequired as e:
-        return {"ok": False, "via": "password", "username": ig_user, "user_id": None, "two_factor": False, "error": f"Login required: {e}"}
-    except Exception as e:
-        return {"ok": False, "via": "password", "username": ig_user, "user_id": None, "two_factor": False, "error": str(e)}
-
+def post_story(client: str, path: str):
+    return _build_client(client).story_upload(path)

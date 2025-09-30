@@ -1,27 +1,20 @@
-# scripts/queue_runner.py
 from __future__ import annotations
-import os, time, json, shutil, importlib.util
+import os, time, json, shutil, importlib.util, sqlite3
 from datetime import datetime, timedelta, timezone
+import pathlib
 
-# ---- Efficient, safe timezone handling with fallback ----
 def _load_ny_tz():
     try:
-        from zoneinfo import ZoneInfo  # needs tzdata on Windows
-        try:
-            return ZoneInfo("America/New_York")
-        except Exception:
-            pass
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("America/New_York")
     except Exception:
-        pass
-    from datetime import timedelta, timezone
-    return timezone(timedelta(hours=-5))  # fallback (no DST)
+        return timezone(timedelta(hours=-5))
 
 NY = _load_ny_tz()
 UTC = timezone.utc
 
-# ---- Lightweight module loader (avoids package import path pitfalls) ----
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+ROOT = pathlib.Path(SCRIPT_DIR).resolve().parent
 
 def _load_mod(name: str, path: str):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -42,20 +35,17 @@ POST_LOG = os.path.join(LOGS_DIR, "post_runner.log")
 with open(os.path.join(LOGS_DIR, "runner.pid"), "w", encoding="utf-8") as f:
     f.write(str(os.getpid()))
 
-# ---- Small in-memory cache to avoid rereading config every loop ----
 _CONFIG_CACHE = {"data": None, "mtime": 0.0}
 
 def _load_config_cached() -> dict:
     try:
-        st = os.stat(CONFIG_FILE)
-        mtime = st.st_mtime
+        st = os.stat(CONFIG_FILE); mtime = st.st_mtime
     except FileNotFoundError:
         return {"safe_mode": True}
     if _CONFIG_CACHE["data"] is None or _CONFIG_CACHE["mtime"] != mtime:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                _CONFIG_CACHE["data"] = json.load(f)
-                _CONFIG_CACHE["mtime"] = mtime
+                _CONFIG_CACHE["data"] = json.load(f); _CONFIG_CACHE["mtime"] = mtime
         except Exception:
             _CONFIG_CACHE["data"] = {"safe_mode": True}
     return _CONFIG_CACHE["data"] or {"safe_mode": True}
@@ -65,57 +55,62 @@ def _ctype_from_path(p: str) -> str:
     parts = rel.split(os.sep)
     if len(parts) >= 2:
         ct = parts[1].lower()
-        if ct in ("feed", "stories", "reels", "weekly"):
+        if ct in ("feed","stories","reels","weekly"):
             return ct
     return "feed"
 
-def _fmt_local(iso_utc: str) -> str:
-    # tolerant parsing (with/without Z)
-    dt = datetime.fromisoformat(iso_utc.replace("Z", ""))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
+def _fmt_local(iso_utc: str|None) -> str:
+    if not iso_utc:
+        return "(n/a)"
+    dt = datetime.fromisoformat(iso_utc.replace("Z",""))
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(NY).strftime("%Y-%m-%d %H:%M")
 
 def log(msg: str):
     stamp = datetime.now(tz=NY).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {msg}"
     print(line)
-    with open(POST_LOG, "a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    with open(POST_LOG, "a", encoding="utf-8") as fh: fh.write(line + "\n")
 
 def _load_client_cfg(client: str) -> dict:
     p = os.path.join(ROOT, "config", "clients", client, "client.json")
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(p, "r", encoding="utf-8") as f: return json.load(f)
     except Exception:
-        return {"live": False}
+        return {"live": False, "quotas": {}}
 
 def _limits(ccfg: dict):
-    # simple per-type daily caps; adjust as needed
+    q = ccfg.get("quotas") or {}
     return {
-        "feed":   max(0, int(ccfg.get("daily_quota", 2))),
-        "stories":max(0, int(ccfg.get("stories_daily_quota", 5))),
-        "reels":  max(0, int(ccfg.get("reels_daily_quota", 2))),
-        "weekly": max(0, int(ccfg.get("weekly_quota", 1))),
+        "reels":   int(q.get("reels_per_day", 2)),
+        "feed":    int(q.get("feed_per_day", 1)),
+        "stories": int(q.get("stories_per_day", 3)),
+        "weekly":  int(q.get("weekly_per_day", 1)),
     }
 
+def _db_path() -> str:
+    return str(ROOT / "data" / "autoposter.db")
+
 def _today_count(client: str, ctype: str) -> int:
-    # counts 'done' posts for (client, ctype) on *local* day
+    """Count how many posts for this client/type were marked done 'today' (NY local)."""
     today = datetime.now(tz=NY).strftime("%Y-%m-%d")
-    with db.get_conn() as c:
-        rows = c.execute("SELECT path, posted_at FROM jobs WHERE client=? AND status='done'", (client,)).fetchall()
+    conn = sqlite3.connect(_db_path()); conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT path, posted_at FROM jobs WHERE client=? AND status='done'",
+            (client,)
+        ).fetchall()
+    finally:
+        conn.close()
     used = 0
     for r in rows:
         pa = r["posted_at"]
-        if not pa:
-            continue
+        if not pa: continue
         try:
             dt = datetime.fromisoformat(pa)
         except Exception:
             continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=UTC)
         if dt.astimezone(NY).strftime("%Y-%m-%d") == today and _ctype_from_path(r["path"]) == ctype:
             used += 1
     return used
@@ -125,23 +120,19 @@ def _next_day_utc(hour_local=11) -> str:
     return local.astimezone(UTC).isoformat()
 
 def _dry_copy(path: str):
-    base = os.path.basename(path)
-    target = os.path.join(EXPORTS_DIR, base)
+    base = os.path.basename(path); target = os.path.join(EXPORTS_DIR, base)
     try:
-        if os.path.exists(path):
-            shutil.copyfile(path, target)
-        else:
-            open(target, "wb").close()
+        if os.path.exists(path): shutil.copyfile(path, target)
+        else: open(target, "wb").close()
     except Exception:
         pass
 
 def _post_live(client: str, path: str, caption: str, ctype: str) -> str:
     lower = path.lower()
-    if lower.endswith(".mp4"):
-        # posts video/Reel; can be expanded with cover image if present
-        return post_instagram.post_video(client, path, caption, ROOT)
-    else:
-        return post_instagram.post_photo(client, path, caption, ROOT)
+    if ctype == "reels":   return str(post_instagram.post_reel(client, path, caption))
+    if ctype == "stories": return str(post_instagram.post_story(client, path))
+    if lower.endswith(".mp4"): return str(post_instagram.post_video(client, path, caption))
+    return str(post_instagram.post_photo(client, path, caption))
 
 def main():
     db.init_db()
@@ -149,57 +140,46 @@ def main():
     safe_mode = bool(cfg.get("safe_mode", True))
     log(f"Queue runner started. Checking every 15s… (SAFE_MODE={'ON' if safe_mode else 'OFF'})")
 
-    sleep_idle = 15
-    sleep_busy = 3
-
     while True:
         due = db.get_due_jobs(limit=50)
         if not due:
-            time.sleep(sleep_idle)
-            continue
+            time.sleep(15); continue
 
         for row in due:
-            job_id = row["id"]; client = row["client"]; path = row["path"]; caption = row["caption"]; eta = row["eta"]
-            ctype = _ctype_from_path(path)
-            ccfg  = _load_client_cfg(client)
-            limits = _limits(ccfg)
-            used = _today_count(client, ctype)
-            limit = limits.get(ctype, 0)
+            job_id = row["id"]; client = row["client"]; path = row["path"]
+            caption = row["caption"] or ""; eta = row["eta"]; ctype = _ctype_from_path(path)
+            ccfg = _load_client_cfg(client); limits = _limits(ccfg)
+            used = _today_count(client, ctype); limit = limits.get(ctype, 0)
 
-            if limit == 0:
+            if limit <= 0:
                 new_eta = _next_day_utc(11)
                 db.reschedule(job_id, new_eta, f"limit=0 for {client}/{ctype}")
-                log(f"SKIP (limit=0) {client}/{ctype}. Rescheduled job#{job_id} -> { _fmt_local(new_eta) }")
-                continue
+                log(f"SKIP (limit=0) {client}/{ctype}. Rescheduled job#{job_id} -> {_fmt_local(new_eta)}"); continue
 
             if used >= limit:
                 new_eta = _next_day_utc(11)
-                db.reschedule(job_id, new_eta, f"quota reached {used}/{limit} for {client}/{ctype}")
-                log(f"QUOTA REACHED: {client}/{ctype} ({used}/{limit}). Rescheduled job#{job_id} -> { _fmt_local(new_eta) }")
-                continue
+                db.reschedule(job_id, new_eta, f"quota {used}/{limit} for {client}/{ctype}")
+                log(f"QUOTA REACHED {client}/{ctype} ({used}/{limit}). Rescheduled job#{job_id} -> {_fmt_local(new_eta)}"); continue
 
             live_allowed = (not safe_mode) and bool(ccfg.get("live", False))
             db.mark_in_progress(job_id)
             log(f"PARSED: when={_fmt_local(eta)} | file={os.path.basename(path)} | client={client} | type={ctype} | used={used}/{limit} | mode={'LIVE' if live_allowed else 'DRY'}")
-
             try:
                 if live_allowed:
                     media_id = _post_live(client, path, caption, ctype)
-                    log(f"POSTED (LIVE): {os.path.basename(path)} | CLIENT: {client} | TYPE: {ctype} | media_id={media_id}")
+                    log(f"✅ POSTED (LIVE): {os.path.basename(path)} | CLIENT {client} | TYPE {ctype} | media_id={media_id}")
                 else:
                     _dry_copy(path)
-                    log(f"POSTED (dry run): {os.path.basename(path)} | CLIENT: {client} | TYPE: {ctype} | CAPTION: {caption.replace(chr(10),' / ')}")
+                    log(f"🧪 POSTED (DRY): {os.path.basename(path)} | CLIENT {client} | TYPE {ctype}")
                 db.mark_done(job_id)
-
             except Exception as e:
-                # retry later with reason persisted
                 new_eta = (datetime.now(tz=UTC) + timedelta(minutes=30)).isoformat()
                 db.reschedule(job_id, new_eta, f"{type(e).__name__}: {e}")
-                log(f"POST FAILURE [{client}/{ctype}]: {e}. RESCHEDULED job#{job_id} -> { _fmt_local(new_eta) }")
-
-        time.sleep(sleep_busy)
+                log(f"❌ POST FAILURE [{client}/{ctype}]: {e}. Rescheduled job#{job_id} -> {_fmt_local(new_eta)}")
+        time.sleep(3)
 
 if __name__ == "__main__":
     main()
+
 
 

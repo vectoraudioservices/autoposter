@@ -1,125 +1,115 @@
-import json
-import time
-import inspect
+import os, time, threading
+from datetime import datetime
 from pathlib import Path
-from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+try:
+    from watchdog.observers import Observer as _Obs
+except Exception:
+    from watchdog.observers.polling import PollingObserver as _Obs
 
-# Your DB helpers
-import scripts.db as db
+from scripts import db
 
-CONTENT_ROOT = Path("content")
-CLIENTS_JSON = Path("config/clients.json")
-VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
+ROOT = Path(__file__).resolve().parent
+CONTENT = ROOT / "content"
+LOGS = ROOT / "logs"
+LOGS.mkdir(parents=True, exist_ok=True)
 
+def log(msg: str):
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] {msg}"
+    print(line)
+    with open(LOGS / "autoposter.log", "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
 
-def load_known_clients():
-    if not CLIENTS_JSON.exists():
-        return set()
+IGNORE_NAMES = {"thumbs.db", ".ds_store"}
+IGNORE_PREFIX = ("~$",)
+IGNORE_EXT = {".tmp", ".part", ".crdownload"}
+VALID_EXT  = {".mp4", ".mov", ".jpg", ".jpeg", ".png"}
+
+PENDING = {}
+LOCK = threading.Lock()
+DEBOUNCE_SEC = 1.0
+
+def _detect_client_type(path: Path) -> tuple[str|None, str]:
     try:
-        data = json.loads(CLIENTS_JSON.read_text(encoding="utf-8"))
-        return set(data.keys())
+        rel = path.resolve().relative_to(CONTENT)
     except Exception:
-        return set()
+        return None, "reels"
+    parts = rel.parts
+    if len(parts) < 2: return None, "reels"
+    client = parts[0]
+    ctype = parts[1].lower()
+    if ctype not in ("reels","feed","stories","weekly"):
+        ctype = "reels"
+    return client, ctype
 
+def handle_new_file(path: Path):
+    if not path.is_file(): return
+    name = path.name.lower()
+    if name in IGNORE_NAMES: return
+    if path.suffix.lower() not in VALID_EXT: return
+    if name.startswith(IGNORE_PREFIX) or path.suffix.lower() in IGNORE_EXT: return
 
-def ensure_folders(clients: set[str]):
-    for c in clients:
-        for sub in ("reels", "feed", "stories"):
-            (CONTENT_ROOT / c / sub).mkdir(parents=True, exist_ok=True)
+    client, ctype = _detect_client_type(path)
+    if not client:
+        log(f"⚠️ Ignoring file outside content/<Client>/<type>/: {path}")
+        return
 
+    full = str(path.resolve())
+    caption = f"🔥 New drop • {datetime.now():%b %d}\nFollow @VectorManagement"
 
-def infer_client(known_clients: set[str], file_path: Path):
-    """Determine client from folder: content/<Client>/<type>/<file>"""
     try:
-        rel = file_path.resolve().relative_to(CONTENT_ROOT.resolve())
-    except Exception:
-        return None
-    parts = list(rel.parts)
-    if len(parts) >= 3:
-        maybe_client, maybe_type = parts[0], parts[1]
-        if maybe_client in known_clients and maybe_type in {"reels", "feed", "stories"}:
-            return maybe_client
-    return None
-
-
-def add_job_flex(conn, client: str, file_path: str):
-    """
-    Call scripts.db.add_job with only the params it actually accepts.
-    Supports variants like:
-      - add_job(conn, client, file)
-      - add_job(conn, client, file, caption=None)
-      - add_job(conn, client, file, eta_iso_utc=None)
-      - add_job(conn, client, file, when=None, caption=None)
-    """
-    fn = db.add_job
-    sig = inspect.signature(fn)
-    params = list(sig.parameters.items())
-
-    # Required base positional args we can always provide in order:
-    base_positional = [conn, client, file_path]
-
-    # Build kwargs ONLY for names that exist (avoid "multiple values" errors)
-    extra_kwargs = {}
-    for name, param in params[3:]:
-        # Only pass explicit names we recognize and set them to None by default
-        if name in ("caption", "cap", "text"):
-            extra_kwargs[name] = None
-        elif name in ("eta_iso_utc", "when", "when_utc", "scheduled_at", "schedule_at"):
-            extra_kwargs[name] = None
-        # else: ignore unknown optional params (db layer will set defaults)
-
-    return fn(*base_positional, **extra_kwargs)
-
-
-class MediaHandler(FileSystemEventHandler):
-    def __init__(self, conn, known_clients: set[str]):
-        super().__init__()
-        self.conn = conn
-        self.known_clients = known_clients
-
-    def _enqueue(self, file_path: Path):
-        if file_path.suffix.lower() not in VIDEO_EXTS:
+        db.init_db()
+        existing = db.get_job_by_path(client, full)
+        if existing:
+            log(f"🔁 Duplicate ignored (already in DB status={existing['status']}): {path.name}")
             return
-        client = infer_client(self.known_clients, file_path)
-        if not client:
-            print(f"⚠️ Skipping {file_path}: cannot determine client (use content/<Client>/(reels|feed|stories)/)")
-            return
-        try:
-            qid = add_job_flex(self.conn, client, str(file_path.resolve()))
-            print(f"✅ Enqueued for {client}: {file_path.name} (queue_id={qid})")
-        except Exception as e:
-            print(f"❌ Failed enqueue {file_path}: {e}")
 
+        job_id = db.add_job(client, full, content_type=ctype, caption=caption, extras={"source":"watcher"})
+        log(f"📦 QUEUED job#{job_id}: {path.name} (client={client}, type={ctype})")
+    except Exception as e:
+        log(f"❌ Failed enqueue {path}: {e}")
+
+class Handler(FileSystemEventHandler):
     def on_created(self, event):
-        if not event.is_directory:
-            self._enqueue(Path(event.src_path))
+        if event.is_directory: return
+        p = Path(event.src_path)
+        with LOCK: PENDING[p] = time.time()
+    def on_modified(self, event):
+        if event.is_directory: return
+        p = Path(event.src_path)
+        with LOCK: PENDING[p] = time.time()
 
-    def on_moved(self, event):
-        if not event.is_directory:
-            self._enqueue(Path(event.dest_path))
-
+def debouncer_loop():
+    while True:
+        time.sleep(0.5)
+        now = time.time()
+        emit = []
+        with LOCK:
+            for p, t0 in list(PENDING.items()):
+                if now - t0 >= DEBOUNCE_SEC:
+                    emit.append(p)
+                    del PENDING[p]
+        for p in emit:
+            handle_new_file(p)
 
 def main():
-    known = load_known_clients()
-    ensure_folders(known)
-    print(f"👀 Multi-client Watcher running. Known clients: {', '.join(sorted(known)) or '(none)'}")
-    print("   Drop files under: content/<Client>/(reels|feed|stories)/")
-
-    conn = db.get_conn()
-    handler = MediaHandler(conn, known)
-    observer = Observer()
-    # One recursive watcher over content/ handles all clients & subfolders
-    observer.schedule(handler, str(CONTENT_ROOT), recursive=True)
-
+    CONTENT.mkdir(parents=True, exist_ok=True)
+    db.init_db()
+    with open(LOGS / "watcher.pid", "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    log("Watcher startup OK.")
+    observer = _Obs()
+    handler = Handler()
+    observer.schedule(handler, str(CONTENT), recursive=True)
     observer.start()
+    log("👀 Watching /content for new files...")
+    threading.Thread(target=debouncer_loop, daemon=True).start()
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
-
 
 if __name__ == "__main__":
     main()
